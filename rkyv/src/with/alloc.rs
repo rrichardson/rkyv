@@ -12,7 +12,7 @@ use crate::{
     Archive, ArchiveUnsized, ArchivedMetadata, Deserialize, DeserializeUnsized, Fallible,
     MetadataResolver, Serialize, SerializeUnsized,
 };
-use ::core::marker::PhantomData;
+use ::core::{marker::PhantomData, mem::ManuallyDrop};
 #[cfg(not(feature = "std"))]
 use alloc::{
     borrow::Cow,
@@ -456,6 +456,64 @@ where
         }
 
         Ok(result)
+    }
+}
+
+impl<T: Archive> ArchiveWith<ManuallyDrop<Box<[T]>>> for CopyOptimize {
+    type Archived = ManuallyDrop<ArchivedBox<[T::Archived]>>;
+    type Resolver = BoxResolver<MetadataResolver<[T]>>;
+
+    unsafe fn resolve_with(
+        field: &ManuallyDrop<Box<[T]>>,
+        pos: usize,
+        resolver: Self::Resolver,
+        out: *mut Self::Archived,
+    ) {
+        ArchivedBox::resolve_from_ref(&**field, pos, resolver, out.cast());
+    }
+}
+
+impl<T, S> SerializeWith<ManuallyDrop<Box<[T]>>, S> for CopyOptimize
+where
+    T: Serialize<S>,
+    S: Serializer,
+{
+    fn serialize_with(
+        field: &ManuallyDrop<Box<[T]>>,
+        serializer: &mut S,
+    ) -> Result<Self::Resolver, S::Error> {
+        use ::core::mem::size_of;
+
+        // Basic debug assert that T and T::Archived are at least the same size
+        debug_assert_eq!(size_of::<T>(), size_of::<T::Archived>());
+
+        unsafe { ArchivedBox::<[T::Archived]>::serialize_copy_from_slice(&**field, serializer) }
+    }
+}
+
+impl<T, D> DeserializeWith<ManuallyDrop<ArchivedBox<[T::Archived]>>, ManuallyDrop<Box<[T]>>, D>
+    for CopyOptimize
+where
+    T: Archive,
+    T::Archived: Deserialize<T, D>,
+    D: Fallible + ?Sized,
+{
+    fn deserialize_with(
+        field: &ManuallyDrop<ArchivedBox<[T::Archived]>>,
+        _: &mut D,
+    ) -> Result<ManuallyDrop<Box<[T]>>, D::Error> {
+        use ::core::{mem::size_of, ptr::copy_nonoverlapping};
+
+        // Basic debug assert that T and T::Archived are at least the same size
+        debug_assert_eq!(size_of::<T>(), size_of::<T::Archived>());
+
+        let mut result = Vec::with_capacity(field.len());
+        unsafe {
+            copy_nonoverlapping(field.as_ptr().cast(), result.as_mut_ptr(), field.len());
+            result.set_len(field.len());
+        }
+
+        Ok(ManuallyDrop::new(result.into_boxed_slice()))
     }
 }
 
